@@ -6,7 +6,7 @@ import flet as ft
 import database as db
 from views import admin, auth, medico, paciente
 
-PUBLIC_ROUTES = {"/", "/login"}
+PUBLIC_ROUTES = {"/", "/login", "/recuperar", "/restablecer"}
 ROLE_HOME = {
     "paciente": "/paciente",
     "medico": "/medico",
@@ -26,6 +26,8 @@ def main(page: ft.Page) -> None:
     routes = {
         "/": auth.index_view,
         "/login": auth.login_view,
+        "/recuperar": auth.forgot_password_view,
+        "/restablecer": auth.reset_password_view,
 
         "/paciente": paciente.dashboard,
         "/paciente/agendar": paciente.appointment_view,

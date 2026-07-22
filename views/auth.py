@@ -1,6 +1,6 @@
 from __future__ import annotations
 import flet as ft
-from database import authenticate
+from database import authenticate, create_password_reset_code, reset_password
 from components.ui import snack
 
 
@@ -55,6 +55,7 @@ def login_view(page: ft.Page) -> ft.View:
             ft.Text(f"Perfil seleccionado: {role.title()}", color=ft.Colors.GREY_600),
             email, password,
             ft.FilledButton("Entrar", icon=ft.Icons.LOGIN, width=340, on_click=login),
+            ft.TextButton("¿Olvidaste tu contraseña?", icon=ft.Icons.LOCK_RESET, on_click=lambda _: page.go("/recuperar")),
             ft.TextButton("← Cambiar perfil", on_click=lambda _: page.go("/")),
             ft.Divider(),
             ft.Text("Prueba: juan@mail.com / paciente1", size=12),
@@ -62,3 +63,63 @@ def login_view(page: ft.Page) -> ft.View:
             ft.Text("Admin: admin@clinica.mx / admin123", size=12),
         ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, tight=True, spacing=14),
     ))])
+
+
+def forgot_password_view(page: ft.Page) -> ft.View:
+    email = ft.TextField(label="Correo electrónico", prefix_icon=ft.Icons.EMAIL)
+    demo_code = ft.Text("", selectable=True, color=ft.Colors.BLUE_700, weight=ft.FontWeight.BOLD)
+
+    def request_code(_):
+        if not email.value:
+            snack(page, "Escribe tu correo.", True)
+            return
+        code = create_password_reset_code(email.value)
+        snack(page, "Si el correo existe, se generó un código temporal.")
+        if code:
+            page.session.set("reset_email", email.value.strip())
+            demo_code.value = f"Código de prueba: {code} (válido 15 minutos)"
+            page.update()
+
+    panel = ft.Container(width=520, padding=32, border_radius=20,
+        bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST,
+        content=ft.Column([
+            ft.Icon(ft.Icons.LOCK_RESET, size=60, color=ft.Colors.BLUE),
+            ft.Text("Recuperar contraseña", size=28, weight=ft.FontWeight.BOLD),
+            ft.Text("En producción el código debe enviarse por correo."),
+            email,
+            ft.FilledButton("Generar código", on_click=request_code),
+            demo_code,
+            ft.FilledButton("Continuar", on_click=lambda _: page.go("/restablecer")),
+            ft.TextButton("Volver", on_click=lambda _: page.go("/login")),
+        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=16))
+    return ft.View("/recuperar", [ft.Container(expand=True, alignment=ft.alignment.center,
+                                                padding=20, content=panel)])
+
+
+def reset_password_view(page: ft.Page) -> ft.View:
+    email = ft.TextField(label="Correo", value=page.session.get("reset_email") or "")
+    code = ft.TextField(label="Código de 6 dígitos")
+    password = ft.TextField(label="Nueva contraseña", password=True, can_reveal_password=True)
+    confirm = ft.TextField(label="Confirmar contraseña", password=True, can_reveal_password=True)
+
+    def save(_):
+        if not all([email.value, code.value, password.value, confirm.value]):
+            snack(page, "Completa todos los campos.", True); return
+        if password.value != confirm.value:
+            snack(page, "Las contraseñas no coinciden.", True); return
+        ok, message = reset_password(email.value, code.value, password.value)
+        snack(page, message, not ok)
+        if ok:
+            page.go("/login")
+
+    panel = ft.Container(width=520, padding=32, border_radius=20,
+        bgcolor=ft.Colors.SURFACE_CONTAINER_HIGHEST,
+        content=ft.Column([
+            ft.Text("Restablecer contraseña", size=28, weight=ft.FontWeight.BOLD),
+            ft.Text("Usa 8 caracteres, mayúscula, minúscula y número."),
+            email, code, password, confirm,
+            ft.FilledButton("Guardar nueva contraseña", icon=ft.Icons.SAVE, on_click=save),
+            ft.TextButton("Volver", on_click=lambda _: page.go("/login")),
+        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER, spacing=14))
+    return ft.View("/restablecer", [ft.Container(expand=True, alignment=ft.alignment.center,
+                                                   padding=20, content=panel)])

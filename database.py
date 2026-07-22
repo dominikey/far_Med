@@ -6,6 +6,8 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterator
 
+from security import hash_password, verify_password, validate_password, reset_code, token_hash, PREFIX
+
 DB_NAME = Path(__file__).with_name("clinica_digital.db")
 
 
@@ -117,6 +119,21 @@ def setup_database() -> None:
         if conn.execute("SELECT COUNT(*) FROM usuarios").fetchone()[0] == 0:
             _seed(conn)
 
+        conn.execute("""CREATE TABLE IF NOT EXISTS password_reset_tokens (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            usuario_id INTEGER NOT NULL REFERENCES usuarios(id) ON DELETE CASCADE,
+            token_hash TEXT NOT NULL,
+            expira_en TEXT NOT NULL,
+            usado INTEGER NOT NULL DEFAULT 0,
+            creado_en TEXT DEFAULT (datetime('now'))
+        )""")
+
+        # Migra automáticamente contraseñas anteriores guardadas en texto plano.
+        for row in conn.execute("SELECT id,contrasena FROM usuarios").fetchall():
+            if row["contrasena"] and not row["contrasena"].startswith(PREFIX + "$"):
+                conn.execute("UPDATE usuarios SET contrasena=? WHERE id=?",
+                             (hash_password(row["contrasena"]), row["id"]))
+
 
 def _seed(conn: sqlite3.Connection) -> None:
     users = [
@@ -173,16 +190,23 @@ def _rows(sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
 
 
 def authenticate(email: str, password: str, expected_role: str | None = None) -> dict[str, Any] | None:
-    sql = "SELECT id,nombre,apellidos,correo,rol,telefono,fecha_nac,tipo_sangre,alergias FROM usuarios WHERE correo=? AND contrasena=?"
     with connection() as conn:
-        row = conn.execute(sql, (email.strip().lower(), password)).fetchone()
+        row = conn.execute("""SELECT id,nombre,apellidos,correo,rol,telefono,fecha_nac,
+                           tipo_sangre,alergias,contrasena
+                           FROM usuarios WHERE lower(correo)=lower(?)""",
+                           (email.strip(),)).fetchone()
         if not row or (expected_role and row["rol"] != expected_role):
             return None
-        user = dict(row)
+        if not verify_password(password, row["contrasena"]):
+            return None
+        user = {k: row[k] for k in ("id","nombre","apellidos","correo","rol",
+                                     "telefono","fecha_nac","tipo_sangre","alergias")}
         if user["rol"] == "medico":
-            med = conn.execute("SELECT id,especialidad,cedula FROM medicos WHERE usuario_id=?", (user["id"],)).fetchone()
+            med = conn.execute("SELECT id,especialidad,cedula FROM medicos WHERE usuario_id=?",
+                               (user["id"],)).fetchone()
             if med:
-                user.update({"medico_id": med["id"], "especialidad": med["especialidad"], "cedula": med["cedula"]})
+                user.update({"medico_id": med["id"], "especialidad": med["especialidad"],
+                             "cedula": med["cedula"]})
         return user
 
 
@@ -298,3 +322,100 @@ def get_notifications() -> list[dict[str, Any]]:
 def mark_notification_sent(notification_id: int) -> None:
     with connection() as conn:
         conn.execute("UPDATE notificaciones SET enviado=1,enviado_en=datetime('now') WHERE id=?", (notification_id,))
+
+# ========================= SEGURIDAD Y RECUPERACIÓN =========================
+
+def create_password_reset_code(email: str) -> str | None:
+    with connection() as conn:
+        user = conn.execute("SELECT id FROM usuarios WHERE lower(correo)=lower(?)", (email.strip(),)).fetchone()
+        if not user:
+            return None
+        code = reset_code()
+        expires = datetime.now() + timedelta(minutes=15)
+        conn.execute("UPDATE password_reset_tokens SET usado=1 WHERE usuario_id=? AND usado=0", (user["id"],))
+        conn.execute("INSERT INTO password_reset_tokens(usuario_id,token_hash,expira_en) VALUES(?,?,?)",
+                     (user["id"], token_hash(code), expires.isoformat(timespec="seconds")))
+        return code
+
+
+def reset_password(email: str, code: str, new_password: str) -> tuple[bool, str]:
+    ok, message = validate_password(new_password)
+    if not ok:
+        return False, message
+    with connection() as conn:
+        user = conn.execute("SELECT id FROM usuarios WHERE lower(correo)=lower(?)", (email.strip(),)).fetchone()
+        if not user:
+            return False, "No se pudo restablecer la contraseña."
+        token = conn.execute("""SELECT id,expira_en FROM password_reset_tokens
+                                WHERE usuario_id=? AND token_hash=? AND usado=0
+                                ORDER BY id DESC LIMIT 1""",
+                             (user["id"], token_hash(code))).fetchone()
+        if not token:
+            return False, "Código incorrecto o ya utilizado."
+        if datetime.fromisoformat(token["expira_en"]) < datetime.now():
+            return False, "El código expiró."
+        conn.execute("UPDATE usuarios SET contrasena=? WHERE id=?", (hash_password(new_password), user["id"]))
+        conn.execute("UPDATE password_reset_tokens SET usado=1 WHERE id=?", (token["id"],))
+        return True, "Contraseña actualizada correctamente."
+
+
+# =============================== CRUD PACIENTES ==============================
+
+def create_patient(data: dict[str, Any]) -> tuple[bool, str]:
+    ok, message = validate_password(data.get("contrasena", ""))
+    if not ok:
+        return False, message
+    try:
+        with connection() as conn:
+            conn.execute("""INSERT INTO usuarios
+                (nombre,apellidos,correo,contrasena,rol,telefono,fecha_nac,tipo_sangre,alergias)
+                VALUES(?,?,?,?, 'paciente',?,?,?,?)""",
+                (data["nombre"].strip(), data["apellidos"].strip(), data["correo"].strip().lower(),
+                 hash_password(data["contrasena"]), data.get("telefono", "").strip(),
+                 data.get("fecha_nac", "").strip() or None, data.get("tipo_sangre", "").strip() or None,
+                 data.get("alergias", "").strip() or None))
+        return True, "Paciente creado correctamente."
+    except sqlite3.IntegrityError:
+        return False, "Ese correo ya está registrado."
+
+
+def get_patient(patient_id: int) -> dict[str, Any] | None:
+    rows = _rows("""SELECT id,nombre,apellidos,correo,telefono,fecha_nac,tipo_sangre,alergias
+                    FROM usuarios WHERE id=? AND rol='paciente'""", (patient_id,))
+    return rows[0] if rows else None
+
+
+def update_patient(patient_id: int, data: dict[str, Any]) -> tuple[bool, str]:
+    try:
+        with connection() as conn:
+            cur = conn.execute("""UPDATE usuarios SET nombre=?,apellidos=?,correo=?,telefono=?,
+                                  fecha_nac=?,tipo_sangre=?,alergias=?
+                                  WHERE id=? AND rol='paciente'""",
+                (data["nombre"].strip(), data["apellidos"].strip(), data["correo"].strip().lower(),
+                 data.get("telefono", "").strip(), data.get("fecha_nac", "").strip() or None,
+                 data.get("tipo_sangre", "").strip() or None, data.get("alergias", "").strip() or None,
+                 patient_id))
+            if cur.rowcount == 0:
+                return False, "Paciente no encontrado."
+        return True, "Paciente actualizado correctamente."
+    except sqlite3.IntegrityError:
+        return False, "Ese correo pertenece a otro usuario."
+
+
+def delete_patient(patient_id: int) -> tuple[bool, str]:
+    # No elimina expedientes: bloquea el acceso cambiando el correo y contraseña.
+    with connection() as conn:
+        cur = conn.execute("""UPDATE usuarios
+                              SET correo='inactivo_'||id||'_'||correo, contrasena=?
+                              WHERE id=? AND rol='paciente'""",
+                           (hash_password(reset_code() + "Aa1"), patient_id))
+        return (cur.rowcount > 0, "Paciente desactivado." if cur.rowcount else "Paciente no encontrado.")
+
+
+# ========================== HISTORIAL SIGNOS VITALES =========================
+
+def get_patient_vitals(patient_id: int, limit: int = 100) -> list[dict[str, Any]]:
+    return _rows("""SELECT id,registrado_en,temperatura,presion_sistol,presion_diast,
+                           frec_cardiaca,saturacion_o2,peso_kg,sintomas
+                    FROM signos_vitales WHERE paciente_id=?
+                    ORDER BY registrado_en DESC,id DESC LIMIT ?""", (patient_id, limit))

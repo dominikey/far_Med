@@ -270,7 +270,7 @@ def table(
         columns=data_columns,
         rows=data_rows,
         column_spacing=30,
-        heading_row_color=ft.Colors.SURFACE_CONTAINER_HIGH,
+        heading_row_color=ft.Colors.SURFACE_CONTAINER_HIGHEST,
         border=ft.border.all(
             1,
             ft.Colors.OUTLINE_VARIANT,
