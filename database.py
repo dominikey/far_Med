@@ -10,9 +10,16 @@ from security import hash_password, verify_password, validate_password, reset_co
 
 DB_NAME = Path(__file__).with_name("clinica_digital.db")
 
+# Política central de agenda: días hábiles, horario y duración de cada espacio.
+BUSINESS_HOURS = {day: ("09:00", "17:00") for day in range(5)}
+APPOINTMENT_MINUTES = 30
+CHECK_IN_EARLY_MINUTES = 30
+CHECK_IN_LATE_MINUTES = 15
+
 
 @contextmanager
 def connection() -> Iterator[sqlite3.Connection]:
+    """Abre una conexión transaccional y revierte cambios ante errores."""
     conn = sqlite3.connect(DB_NAME)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
@@ -27,6 +34,7 @@ def connection() -> Iterator[sqlite3.Connection]:
 
 
 def setup_database() -> None:
+    """Crea el esquema y migra credenciales heredadas al formato seguro."""
     with connection() as conn:
         conn.executescript("""
         CREATE TABLE IF NOT EXISTS usuarios (
@@ -211,8 +219,44 @@ def authenticate(email: str, password: str, expected_role: str | None = None) ->
 
 
 def list_doctors() -> list[dict[str, Any]]:
-    return _rows("""SELECT m.id, u.nombre||' '||u.apellidos nombre, m.especialidad, m.cedula
+    return _rows("""SELECT m.id, u.nombre||' '||u.apellidos nombre, m.especialidad,
+                    m.cedula, m.max_citas_dia
                     FROM medicos m JOIN usuarios u ON u.id=m.usuario_id ORDER BY m.especialidad,u.nombre""")
+
+
+def appointment_policy_message() -> str:
+    """Devuelve la política que se muestra al paciente."""
+    return (
+        "Horario: lunes a viernes de 09:00 a 17:00, en espacios de "
+        f"{APPOINTMENT_MINUTES} minutos. Check-in desde "
+        f"{CHECK_IN_EARLY_MINUTES} minutos antes y hasta "
+        f"{CHECK_IN_LATE_MINUTES} minutos después."
+    )
+
+
+def appointment_hours() -> list[str]:
+    """Genera los horarios del formulario desde la política central."""
+    start = datetime.strptime("09:00", "%H:%M")
+    end = datetime.strptime("17:00", "%H:%M")
+    hours = []
+    while start < end:
+        hours.append(start.strftime("%H:%M"))
+        start += timedelta(minutes=APPOINTMENT_MINUTES)
+    return hours
+
+
+def _valid_schedule(appointment_date: date, hour: str) -> bool:
+    """Valida día hábil, rango de atención y bloques de media hora."""
+    schedule = BUSINESS_HOURS.get(appointment_date.weekday())
+    if not schedule:
+        return False
+    try:
+        appointment_time = datetime.strptime(hour, "%H:%M").time()
+    except ValueError:
+        return False
+    opening = datetime.strptime(schedule[0], "%H:%M").time()
+    closing = datetime.strptime(schedule[1], "%H:%M").time()
+    return opening <= appointment_time < closing and appointment_time.minute in (0, 30)
 
 
 def get_patient_appointments(patient_id: int) -> list[dict[str, Any]]:
@@ -222,13 +266,118 @@ def get_patient_appointments(patient_id: int) -> list[dict[str, Any]]:
 
 
 def reserve_appointment(patient_id: int, doctor_id: int, appointment_date: str, hour: str, modality: str, reason: str) -> tuple[bool, str]:
+    """Reserva una cita respetando horario y máximo diario del médico."""
+    try:
+        selected_date = date.fromisoformat(appointment_date)
+    except (TypeError, ValueError):
+        return False, "La fecha debe tener el formato AAAA-MM-DD."
+    if selected_date < date.today():
+        return False, "La fecha no puede estar en el pasado."
+    if not _valid_schedule(selected_date, hour):
+        return False, appointment_policy_message()
+    if modality not in ("presencial", "telemedicina"):
+        return False, "La modalidad seleccionada no es válida."
+    if not reason.strip():
+        return False, "Escribe el motivo de consulta."
     try:
         with connection() as conn:
+            # El bloqueo impide que reservas simultáneas rebasen el cupo.
+            conn.execute("BEGIN IMMEDIATE")
+            doctor = conn.execute(
+                "SELECT max_citas_dia FROM medicos WHERE id=?", (doctor_id,)
+            ).fetchone()
+            if not doctor:
+                return False, "El médico seleccionado no existe."
+            booked = conn.execute(
+                """SELECT COUNT(*) FROM citas
+                   WHERE medico_id=? AND fecha=? AND estado!='cancelada'""",
+                (doctor_id, appointment_date),
+            ).fetchone()[0]
+            if booked >= doctor["max_citas_dia"]:
+                return False, (
+                    f"El médico alcanzó su máximo de {doctor['max_citas_dia']} "
+                    "citas para ese día. Selecciona otra fecha."
+                )
             conn.execute("INSERT INTO citas(paciente_id,medico_id,fecha,hora,modalidad,motivo,estado) VALUES(?,?,?,?,?,?, 'confirmada')",
                          (patient_id, doctor_id, appointment_date, hour, modality, reason.strip()))
         return True, "Cita agendada correctamente."
     except sqlite3.IntegrityError:
         return False, "Ese horario ya está ocupado. Selecciona otro."
+
+
+def check_in_appointment(
+    appointment_id: int,
+    patient_id: int,
+    priority: str = "normal",
+) -> tuple[bool, str, int | None]:
+    """Registra la llegada y asigna el siguiente turno de forma atómica."""
+    if priority not in ("normal", "urgencia", "adulto_mayor"):
+        return False, "La prioridad no es válida.", None
+    with connection() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        appointment = conn.execute(
+            """SELECT c.id,c.fecha,c.hora,c.modalidad,c.estado,u.fecha_nac
+               FROM citas c JOIN usuarios u ON u.id=c.paciente_id
+               WHERE c.id=? AND c.paciente_id=?""",
+            (appointment_id, patient_id),
+        ).fetchone()
+        if not appointment:
+            return False, "La cita no existe.", None
+        if appointment["modalidad"] != "presencial":
+            return False, "El check-in solo aplica a citas presenciales.", None
+        if appointment["estado"] != "confirmada":
+            existing = conn.execute(
+                "SELECT turno FROM cola_espera WHERE cita_id=?", (appointment_id,)
+            ).fetchone()
+            if existing:
+                return True, f"Check-in ya registrado: turno #{existing['turno']}.", existing["turno"]
+            return False, "Esta cita ya no admite check-in.", None
+
+        # La prioridad de adulto mayor se obtiene del expediente y no depende
+        # de que el paciente la solicite manualmente.
+        if priority == "normal" and appointment["fecha_nac"]:
+            birth_date = date.fromisoformat(appointment["fecha_nac"])
+            today = date.today()
+            age = today.year - birth_date.year - (
+                (today.month, today.day) < (birth_date.month, birth_date.day)
+            )
+            if age >= 60:
+                priority = "adulto_mayor"
+
+        appointment_at = datetime.fromisoformat(
+            f"{appointment['fecha']}T{appointment['hora']}:00"
+        )
+        now = datetime.now()
+        window_start = appointment_at - timedelta(minutes=CHECK_IN_EARLY_MINUTES)
+        window_end = appointment_at + timedelta(minutes=CHECK_IN_LATE_MINUTES)
+        if not window_start <= now <= window_end:
+            return False, (
+                f"Puedes hacer check-in de {window_start:%H:%M} a "
+                f"{window_end:%H:%M} el {appointment_at:%Y-%m-%d}."
+            ), None
+
+        # Los turnos son consecutivos por día, no globales.
+        next_turn = conn.execute(
+            """SELECT COALESCE(MAX(q.turno), 0) + 1
+               FROM cola_espera q JOIN citas c ON c.id=q.cita_id
+               WHERE c.fecha=?""",
+            (appointment["fecha"],),
+        ).fetchone()[0]
+        conn.execute(
+            """INSERT INTO cola_espera(cita_id,turno,prioridad,estado)
+               VALUES(?,?,?,'en_espera')""",
+            (appointment_id, next_turn, priority),
+        )
+        conn.execute(
+            "UPDATE citas SET estado='en_espera',version=version+1 WHERE id=?",
+            (appointment_id,),
+        )
+        conn.execute(
+            """INSERT INTO notificaciones(cita_id,paciente_id,tipo,canal)
+               VALUES(?,?,'turno','app')""",
+            (appointment_id, patient_id),
+        )
+        return True, f"Check-in listo. Tu turno es #{next_turn}.", next_turn
 
 
 def cancel_appointment(appointment_id: int, patient_id: int) -> bool:

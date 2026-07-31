@@ -60,6 +60,7 @@ def dashboard(page: ft.Page) -> ft.View:
 
 
 def appointment_view(page: ft.Page) -> ft.View:
+    """Construye el formulario según la política central de agenda."""
     user = _user(page)
     doctors = db.list_doctors()
 
@@ -68,7 +69,10 @@ def appointment_view(page: ft.Page) -> ft.View:
         options=[
             ft.dropdown.Option(
                 key=str(item["id"]),
-                text=f'{item["nombre"]} · {item["especialidad"]}',
+                text=(
+                    f'{item["nombre"]} · {item["especialidad"]} · '
+                    f'máx. {item["max_citas_dia"]} citas/día'
+                ),
             )
             for item in doctors
         ],
@@ -94,10 +98,7 @@ def appointment_view(page: ft.Page) -> ft.View:
         label="Hora",
         options=[
             ft.dropdown.Option(key=value, text=value)
-            for value in [
-                "09:00", "09:30", "10:00", "10:30", "11:00",
-                "11:30", "12:00", "16:00", "16:30", "17:00",
-            ]
+            for value in db.appointment_hours()
         ],
         value="09:00",
     )
@@ -148,6 +149,15 @@ def appointment_view(page: ft.Page) -> ft.View:
                 page_title(
                     "Agendar nueva cita",
                     "Selecciona médico, fecha, horario y modalidad.",
+                ),
+                ft.Container(
+                    padding=12,
+                    border_radius=10,
+                    bgcolor=ft.Colors.BLUE_50,
+                    content=ft.Row([
+                        ft.Icon(ft.Icons.INFO_OUTLINE, color=ft.Colors.BLUE),
+                        ft.Text(db.appointment_policy_message(), expand=True),
+                    ]),
                 ),
                 doctor,
                 modality,
@@ -209,6 +219,13 @@ def appointments_view(page: ft.Page) -> ft.View:
         else:
             snack(page, "No se pudo cancelar la cita.", True)
 
+    def check_in(appointment_id: int) -> None:
+        """Solicita turno; la capa de datos valida fecha y horario."""
+        ok, message, _ = db.check_in_appointment(appointment_id, user["id"])
+        snack(page, message, not ok)
+        if ok:
+            page.go("/paciente/cola")
+
     rows = []
     for item in data:
         rows.append(
@@ -223,15 +240,25 @@ def appointments_view(page: ft.Page) -> ft.View:
                         ft.Text(str(item["estado"]).replace("_", " ").title())
                     ),
                     ft.DataCell(
-                        ft.IconButton(
-                            icon=ft.Icons.CANCEL_OUTLINED,
-                            tooltip="Cancelar",
-                            disabled=item["estado"] not in (
-                                "confirmada", "en_espera"
+                        ft.Row([
+                            ft.IconButton(
+                                icon=ft.Icons.HOW_TO_REG,
+                                tooltip="Hacer check-in",
+                                disabled=item["estado"] != "confirmada"
+                                or item["modalidad"] != "presencial",
+                                on_click=lambda _, appointment_id=item["id"]:
+                                    check_in(appointment_id),
                             ),
-                            on_click=lambda _, appointment_id=item["id"]:
-                                cancel(appointment_id),
-                        )
+                            ft.IconButton(
+                                icon=ft.Icons.CANCEL_OUTLINED,
+                                tooltip="Cancelar",
+                                disabled=item["estado"] not in (
+                                    "confirmada", "en_espera"
+                                ),
+                                on_click=lambda _, appointment_id=item["id"]:
+                                    cancel(appointment_id),
+                            ),
+                        ])
                     ),
                 ]
             )
@@ -252,7 +279,7 @@ def appointments_view(page: ft.Page) -> ft.View:
         route="/paciente/citas",
         controls=[
             _scroll_content([
-                page_title("Mis citas", "Historial y citas programadas."),
+                page_title("Mis citas", db.appointment_policy_message()),
                 ft.Row(
                     controls=[data_table],
                     scroll=ft.ScrollMode.AUTO,

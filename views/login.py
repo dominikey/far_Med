@@ -1,10 +1,9 @@
 import flet as ft
-import sqlite3
-
-DB_NAME = "clinica_digital.db"
+from database import authenticate
 
 
 class LoginView(ft.View):
+    """Clase pública de compatibilidad para el inicio de sesión."""
 
     def __init__(self, page: ft.Page):
         super().__init__(
@@ -13,15 +12,17 @@ class LoginView(ft.View):
             vertical_alignment=ft.MainAxisAlignment.CENTER,
         )
 
-        self.page = page
+        # Un guion bajo indica acceso protegido para posibles subclases.
+        self._page = page
 
-        self.correo = ft.TextField(
+        self._correo = ft.TextField(
             label="Correo electrónico",
             width=350,
             prefix_icon=ft.Icons.EMAIL,
         )
 
-        self.password = ft.TextField(
+        # Dos guiones bajos aplican name mangling: atributo privado.
+        self.__password = ft.TextField(
             label="Contraseña",
             password=True,
             can_reveal_password=True,
@@ -62,16 +63,16 @@ class LoginView(ft.View):
 
                         ft.Divider(),
 
-                        self.correo,
+                        self._correo,
 
-                        self.password,
+                        self.__password,
 
                         ft.ElevatedButton(
                             "Ingresar",
                             icon=ft.Icons.LOGIN,
                             width=350,
                             height=50,
-                            on_click=self.login,
+                            on_click=self._login,
                         ),
 
                     ],
@@ -79,69 +80,41 @@ class LoginView(ft.View):
             )
         ]
 
-    def login(self, e):
+    def _login(self, _event):
+        """Método protegido que delega la verificación segura."""
 
-        correo = self.correo.value.strip()
-        password = self.password.value.strip()
+        correo = self._correo.value.strip()
+        password = self.__password.value
 
         if correo == "" or password == "":
 
-            self.page.snack_bar = ft.SnackBar(
+            self._page.snack_bar = ft.SnackBar(
                 ft.Text("Debes llenar todos los campos")
             )
-            self.page.snack_bar.open = True
-            self.page.update()
+            self._page.snack_bar.open = True
+            self._page.update()
             return
 
-        conn = sqlite3.connect(DB_NAME)
-        cursor = conn.cursor()
-
-        cursor.execute(
-            """
-            SELECT
-                id,
-                nombre,
-                apellidos,
-                correo,
-                rol
-            FROM usuarios
-            WHERE correo=?
-            AND contrasena=?
-            """,
-            (correo, password),
-        )
-
-        usuario = cursor.fetchone()
-
-        conn.close()
+        usuario = authenticate(correo, password)
 
         if usuario is None:
 
-            self.page.snack_bar = ft.SnackBar(
+            self._page.snack_bar = ft.SnackBar(
                 ft.Text("Correo o contraseña incorrectos")
             )
-            self.page.snack_bar.open = True
-            self.page.update()
+            self._page.snack_bar.open = True
+            self._page.update()
             return
 
-        self.page.session.set(
-            "usuario",
-            {
-                "id": usuario[0],
-                "nombre": usuario[1],
-                "apellidos": usuario[2],
-                "correo": usuario[3],
-                "rol": usuario[4],
-            },
-        )
+        self._page.session.set("user", usuario)
 
-        rol = usuario[4]
+        rol = usuario["rol"]
 
         if rol == "paciente":
-            self.page.go("/paciente")
+            self._page.go("/paciente")
 
         elif rol == "medico":
-            self.page.go("/medico")
+            self._page.go("/medico")
 
         elif rol == "admin":
-            self.page.go("/admin")
+            self._page.go("/admin")
